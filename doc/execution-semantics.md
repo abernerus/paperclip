@@ -1,7 +1,7 @@
 # Execution Semantics
 
 Status: Current implementation guide
-Date: 2026-05-23
+Date: 2026-06-02
 Audience: Product and engineering
 
 This document explains how Paperclip interprets issue assignment, issue status, execution runs, wakeups, parent/sub-issue structure, and blocker relationships.
@@ -83,6 +83,29 @@ The work is complete and terminal.
 ### `cancelled`
 
 The work will not continue and is terminal.
+
+### Routine-execution post-run modes
+
+`originKind = routine_execution` issues need an explicit post-run disposition
+contract. Paperclip must not infer that contract from free-form comments.
+
+Each routine execution issue uses one of two opposite modes:
+
+- `done_per_fire`: each fire is a one-round execution issue. The round must
+  reach a terminal disposition before it is considered complete. If the round's
+  only remaining work is to wait on a human, review, or sibling issue, the
+  agent should post a durable deferral that names the real gate issue and then
+  terminate the routine issue as `done`. The human/review gate remains on that
+  separate issue, not on the finished routine round.
+- `standing_thread`: the routine execution issue is the durable recurring
+  thread. Between fires it may remain `in_progress` or `blocked`, but only when
+  it still has a valid live or waiting path under the normal liveness contract.
+  The next fire resumes the same thread instead of requiring a fresh issue.
+
+For recovery and liveness checks, Paperclip must treat these modes as
+opposites. A `done_per_fire` round with a posted deferral is complete, not a
+passive waiting thread. A `standing_thread` round may remain open between fires
+only when the waiting path is explicit and healthy.
 
 ## 4. Agent-Owned vs User-Owned Execution
 
@@ -484,6 +507,12 @@ Examples:
 
 Auto-recovery preserves the existing owner. It does not choose a replacement agent.
 
+For `originKind = routine_execution`, this rule is stricter: generic
+stranded-issue or missing-disposition recovery may not rewrite ownership across
+domains. It may requeue the routine's current assignee or use a routine-declared
+same-domain recovery owner, but it must not hand a routine round to a default
+cross-domain overseer merely because the round missed a disposition.
+
 ### Explicit Recovery Action
 
 Paperclip opens an explicit recovery action when the system can identify a problem but cannot safely complete the work itself.
@@ -495,6 +524,10 @@ Examples:
 - an active run is silent past the watchdog threshold
 
 The recovery action stays source-scoped by default. The source issue should show the recovery owner, cause, evidence, next action, and wake or monitor policy in its own thread/detail surface.
+
+For `originKind = routine_execution`, source-scoped recovery must preserve the
+routine's owning domain. Generic recovery may not assign a cross-domain default
+owner when the real problem is a missing or ambiguous routine disposition.
 
 Create an issue-backed recovery action only when a separate issue is the right execution object. In that fallback form, the source issue remains visible and is blocked on the recovery issue when blocking is necessary for correctness. The recovery owner must restore a live path, resolve the source issue manually, delegate real follow-up work, or record the reason the signal is a false positive.
 
