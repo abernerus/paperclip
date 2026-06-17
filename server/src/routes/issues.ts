@@ -2977,7 +2977,14 @@ export function issueRoutes(
 
     const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
     if (outcome === "false_positive" || outcome === "cancelled") {
-      assertBoard(req);
+      const isOwnerAgent =
+        req.actor.type === "agent" &&
+        req.actor.agentId != null &&
+        activeRecoveryAction != null &&
+        activeRecoveryAction.ownerAgentId === req.actor.agentId;
+      if (!isOwnerAgent) {
+        assertBoard(req);
+      }
     }
 
     const actor = getActorInfo(req);
