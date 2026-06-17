@@ -1177,4 +1177,99 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("allows a recovery action owner agent to resolve their own action as false_positive without board access", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:owner-false-positive",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Confirm the recovery signal was spurious.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const runId = randomUUID();
+    const app = createApp({
+      type: "agent",
+      agentId: managerId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: sourceIssueId });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "false_positive",
+        sourceIssueStatus: "done",
+        resolutionNote: "Recovery signal was a false alarm — issue is complete.",
+      })
+      .expect(200);
+
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "false_positive",
+    });
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      activeRecoveryAction: null,
+    });
+  });
+
+  it("rejects false_positive resolution by a peer agent who has assignee-authority but is not the recovery action owner", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:peer-false-positive",
+      evidence: { sourceRunId: "run-2" },
+      nextAction: "Confirm the recovery signal was spurious.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    // coderId is the issue assignee → passes assertRecoveryActionAuthority, but is not the owner
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "false_positive",
+        sourceIssueStatus: "done",
+        resolutionNote: "Peer agent should not clear another owner's recovery action.",
+      })
+      .expect(403);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null });
+  });
 });
