@@ -1,17 +1,7 @@
 ---
 name: terminal-bench-loop
 description: >
-  Run a single Terminal-Bench problem through Paperclip in a bounded,
-  human-in-the-loop improvement cycle until the smoke passes, the board
-  rejects the next fix, the iteration budget is exhausted, or a real
-  blocker is named. Each iteration runs a bounded smoke against an
-  isolated Paperclip App worktree, captures artifacts, diagnoses the
-  exact stop point with `/diagnose-why-work-stopped`, requests board
-  confirmation before any product fix, then reruns against the same
-  worktree. Use whenever an issue asks to "run Terminal-Bench in a
-  loop", "drive Terminal-Bench until it passes", "loop fix-git through
-  Paperclip", or otherwise points at a Terminal-Bench task and asks for
-  bounded iteration with diagnosis.
+  Run Paperclip terminal-bench loops; use to create, execute, debug, and iterate benchmark tasks until the expected terminal behavior passes.
 ---
 
 # Terminal-Bench Loop

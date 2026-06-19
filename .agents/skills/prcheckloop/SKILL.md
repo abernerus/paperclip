@@ -1,12 +1,7 @@
 ---
 name: prcheckloop
 description: >
-  Iteratively gets a GitHub pull request's checks green. Detects the PR for the
-  current branch or uses a provided PR number, waits for every check on the
-  latest head SHA to appear and finish, investigates failing checks, fixes
-  actionable code or test issues, pushes, and repeats. Escalates with a precise
-  blocker when failures are external, flaky, or not safely fixable. Use when a
-  PR still has unsuccessful checks after review fixes, including after greploop.
+  Run Paperclip PR check loops; use to inspect failing checks, apply fixes, rerun validation, and report CI status.
 ---
 
 # PRCheckloop

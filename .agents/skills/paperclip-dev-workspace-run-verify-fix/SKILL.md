@@ -1,12 +1,7 @@
 ---
 name: paperclip-dev-workspace-run-verify-fix
 description: >
-  Run, verify, reseed, and repair a Paperclip isolated dev workspace service.
-  Use when asked to start or fix a Paperclip project/worktree service and prove
-  that it is managed by the Paperclip runtime, has the full bootstrapped cloned
-  database, is healthy, accepts normal dev credentials, exposes populated app
-  data, and is visible as running from both the control-plane and the served
-  workspace app.
+  Run, verify, and fix Paperclip development workspaces; use for local dev setup, checks, failures, and implementation validation.
 ---
 
 # Paperclip Dev Workspace Run / Verify / Fix

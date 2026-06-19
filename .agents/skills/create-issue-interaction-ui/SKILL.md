@@ -1,15 +1,7 @@
 ---
 name: create-issue-interaction-ui
 description: >
-  Developer/maintainer skill for adding a new issue-thread interaction kind to
-  the Paperclip codebase end-to-end: shared contract, server service/routes,
-  UI card, fixtures/Storybook, CLI/MCP/plugin SDK helpers, agent guidance, and
-  tests. Use when a Paperclip contributor is asked to introduce a new
-  interaction family (something analogous to `request_confirmation`,
-  `request_checkbox_confirmation`, `ask_user_questions`, or `suggest_tasks`)
-  or to extend the issue-thread interaction system with a new card type. Do
-  NOT install this on production Paperclip agents — it is for repo work, not
-  agent runtime behavior.
+  Build Paperclip issue interaction UI; use for frontend components, pages, actions, and state around issue comments, status, and agent activity.
 ---
 
 # Create a new issue-thread interaction UI (developer skill)
