@@ -2272,6 +2272,67 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
   }
 
+  // Detect a valid manual re-delegation of a source issue that already carries an
+  // active stranded recovery action. When an officer reassigns the blocked issue to a
+  // different invokable agent (e.g. the Artificer), the current visible assignee will
+  // differ from every owner the recovery action has recorded so far. In that case the
+  // delegate — not its manager — should own the recovery, and the visible assignee must
+  // never be clobbered back to a manager on the next retry. Returns the delegate agent
+  // id when a manual re-delegation is detected, otherwise null (preserve existing
+  // first-strand escalation behavior).
+  async function detectManualRecoveryRedelegation(input: {
+    issue: typeof issues.$inferSelect;
+    existing: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
+  }): Promise<string | null> {
+    const { issue, existing } = input;
+    if (!existing) return null;
+    const assigneeAgentId = issue.assigneeAgentId;
+    if (!assigneeAgentId) return null;
+
+    // No re-delegation if the current assignee is one the recovery action already knows
+    // about: its owner, the pre-escalation owner, or the recorded return owner.
+    const knownOwners = new Set(
+      [existing.ownerAgentId, existing.previousOwnerAgentId, existing.returnOwnerAgentId]
+        .filter((id): id is string => Boolean(id)),
+    );
+    if (knownOwners.has(assigneeAgentId)) return null;
+
+    // Only treat it as a durable delegation when the new assignee is actually invokable
+    // and has budget to run the issue — otherwise fall back to normal escalation.
+    const assignee = await getAgent(assigneeAgentId);
+    if (!assignee || assignee.companyId !== issue.companyId) return null;
+    if (!(await isAgentInvokable(assignee))) return null;
+    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, assignee.id, {
+      issueId: issue.id,
+      projectId: issue.projectId,
+    });
+    if (budgetBlock) return null;
+
+    return assigneeAgentId;
+  }
+
+  // Returns the existing recovery owner when they are still the current assignee and are
+  // still invokable with budget. This prevents resolveStrandedIssueRecoveryOwnerAgentId
+  // from promoting to the manager on a second (or later) strand of a delegated agent —
+  // the manager-first ranking in the resolver is correct for fresh escalations but must
+  // not clobber an already-transferred delegated assignee.
+  async function preserveRecoveryOwnerIfMatchesAssignee(
+    existingAction: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>,
+    issue: typeof issues.$inferSelect,
+  ): Promise<string | null> {
+    if (!existingAction?.ownerAgentId) return null;
+    if (existingAction.ownerAgentId !== issue.assigneeAgentId) return null;
+    const owner = await getAgent(existingAction.ownerAgentId);
+    if (!owner || owner.companyId !== issue.companyId) return null;
+    if (!(await isAgentInvokable(owner))) return null;
+    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, owner.id, {
+      issueId: issue.id,
+      projectId: issue.projectId,
+    });
+    if (budgetBlock) return null;
+    return existingAction.ownerAgentId;
+  }
+
   async function ensureSourceScopedStrandedRecoveryAction(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -2280,7 +2341,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const existingAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    const delegateOwnerAgentId = await detectManualRecoveryRedelegation({
+      issue: input.issue,
+      existing: existingAction,
+    });
+    // Resolution chain:
+    // 1. New manual re-delegation: transfer ownership to the new delegate.
+    // 2. Existing owner matches current assignee and is still valid: keep them — do not
+    //    let resolveStrandedIssueRecoveryOwnerAgentId promote to their manager on a
+    //    second (or later) strand.
+    // 3. Fresh escalation: use the manager / creator / executive chain.
+    const ownerAgentId = delegateOwnerAgentId
+      ?? await preserveRecoveryOwnerIfMatchesAssignee(existingAction, input.issue)
+      ?? await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,

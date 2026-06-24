@@ -3035,6 +3035,264 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("keeps a manually delegated assignee on a blocked issue across stranded recovery retries (CAS-6342)", async () => {
+    // CAS-6342: when an officer manually delegates a blocked issue that carries an
+    // active stranded_assigned_issue recovery to a different invokable agent, recovery
+    // retries must NOT snap the visible assignee back to the original assignee's manager.
+    const companyId = randomUUID();
+    const managerAgentId = randomUUID();
+    const originalAssigneeAgentId = randomUUID();
+    const delegateAgentId = randomUUID();
+    const issueId = randomUUID();
+    const firstRunId = randomUUID();
+    const retryRunId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const firstStrand = new Date("2026-03-19T00:00:00.000Z");
+    // Future-dated so the delegate's retry run is unambiguously the latest run for the
+    // issue, ahead of any wall-clock run the first escalation's owner wake produces.
+    const retryStrand = new Date("2999-01-01T00:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    // Manager ("Master of Craft", cto) is the agent the buggy resolver snapped to.
+    await db.insert(agents).values([
+      {
+        id: managerAgentId,
+        companyId,
+        name: "MasterOfCraft",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: originalAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerAgentId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: delegateAgentId,
+        companyId,
+        name: "Artificer",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerAgentId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    // First strand: a non-retryable failure on the original assignee's run. Insert the
+    // run before the issue so the issue's checkout_run_id FK resolves.
+    await db.insert(heartbeatRuns).values({
+      id: firstRunId,
+      companyId,
+      agentId: originalAssigneeAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: firstStrand,
+      finishedAt: firstStrand,
+      createdAt: firstStrand,
+      updatedAt: firstStrand,
+      errorCode: "budget_blocked",
+      error: "Budget exceeded; refusing to dispatch.",
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Recover stranded assigned work",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: originalAssigneeAgentId,
+      checkoutRunId: firstRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: firstStrand,
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    // First reconcile escalates: issue → blocked. With the bug, the recovery owner and
+    // the visible assignee are both snapped to the manager.
+    const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(firstResult.escalated).toBe(1);
+    expect(firstResult.issueIds).toEqual([issueId]);
+
+    const afterFirst = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterFirst?.status).toBe("blocked");
+    // Confirms the buggy default: with no manual delegation the manager owns recovery
+    // and is written onto the visible assignee.
+    expect(afterFirst?.assigneeAgentId).toBe(managerAgentId);
+
+    const recoveryActionAfterFirst = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryActionAfterFirst?.ownerAgentId).toBe(managerAgentId);
+    expect(recoveryActionAfterFirst?.previousOwnerAgentId).toBe(originalAssigneeAgentId);
+    expect(recoveryActionAfterFirst?.returnOwnerAgentId).toBe(originalAssigneeAgentId);
+
+    // The first escalation enqueues a recovery wake for the owner; let any resulting
+    // background runs settle before staging the retry so they don't race the assertions.
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // The delegate's run strands the same way, triggering a recovery retry. Timestamp it
+    // in the future so it is unambiguously the latest run for the issue even if the
+    // first escalation's owner wake produced its own (newer-by-wall-clock) run.
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId: delegateAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: retryStrand,
+      finishedAt: retryStrand,
+      createdAt: retryStrand,
+      updatedAt: retryStrand,
+      errorCode: "budget_blocked",
+      error: "Budget exceeded; refusing to dispatch.",
+    });
+
+    // Officer manually delegates the blocked issue to the Artificer (a different
+    // invokable agent) and the delegate picks it up (status → in_progress) so the next
+    // reconcile re-evaluates the same active recovery action.
+    await db
+      .update(issues)
+      .set({
+        assigneeAgentId: delegateAgentId,
+        status: "in_progress",
+        checkoutRunId: retryRunId,
+        startedAt: retryStrand,
+      })
+      .where(eq(issues.id, issueId));
+
+    // Recovery retry: must transfer ownership to the delegate and keep the delegate as
+    // the visible assignee — never snap back to the manager.
+    const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondResult.escalated).toBe(1);
+    expect(secondResult.issueIds).toEqual([issueId]);
+
+    const afterRetry = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterRetry?.status).toBe("blocked");
+    // AC1: the delegated assignee is preserved across the recovery retry.
+    expect(afterRetry?.assigneeAgentId).toBe(delegateAgentId);
+
+    const recoveryActionAfterRetry = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    // AC2: recovery-owner metadata is transferred to the delegate for audit/control
+    // without overwriting the visible assignee with a manager.
+    expect(recoveryActionAfterRetry?.id).toBe(recoveryActionAfterFirst?.id);
+    expect(recoveryActionAfterRetry?.ownerAgentId).toBe(delegateAgentId);
+    expect(recoveryActionAfterRetry?.attemptCount).toBe(2);
+
+    // Let background wakes from the second escalation settle before staging the third strand.
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // === Second delegate strand (CAS-6342 second-retry gap) ===
+    // After ownership transferred to delegate, the delegate itself strands again.
+    // recovery.ownerAgentId == issue.assigneeAgentId == delegate, so detect() returns null
+    // (delegate is in knownOwners). Without the preserve guard, resolveStrandedIssueRecoveryOwnerAgentId
+    // promotes to the delegate's manager, clobbering the visible assignee back to the manager.
+    const secondRetryRunId = randomUUID();
+    const secondRetryStrand = new Date("2999-06-01T00:00:00.000Z");
+
+    await db.insert(heartbeatRuns).values({
+      id: secondRetryRunId,
+      companyId,
+      agentId: delegateAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: secondRetryStrand,
+      finishedAt: secondRetryStrand,
+      createdAt: secondRetryStrand,
+      updatedAt: secondRetryStrand,
+      errorCode: "budget_blocked",
+      error: "Budget exceeded; refusing to dispatch.",
+    });
+
+    // Simulate the delegate picking up and stranding again (status back to in_progress,
+    // then the reconcile fires for the second time with the delegate as assignee).
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        checkoutRunId: secondRetryRunId,
+        startedAt: secondRetryStrand,
+      })
+      .where(eq(issues.id, issueId));
+
+    const thirdResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(thirdResult.escalated).toBe(1);
+    expect(thirdResult.issueIds).toEqual([issueId]);
+
+    const afterSecondRetry = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterSecondRetry?.status).toBe("blocked");
+    // AC: delegate's assignee survives the second recovery retry — must not revert to manager.
+    expect(afterSecondRetry?.assigneeAgentId).toBe(delegateAgentId);
+
+    const recoveryActionAfterSecondRetry = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryActionAfterSecondRetry?.ownerAgentId).toBe(delegateAgentId);
+    expect(recoveryActionAfterSecondRetry?.attemptCount).toBe(3);
+  });
+
   it("leaves the productive-but-stranded continuation path unchanged under the new classifier", async () => {
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
