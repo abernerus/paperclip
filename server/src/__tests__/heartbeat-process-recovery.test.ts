@@ -3227,6 +3227,70 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recoveryActionAfterRetry?.id).toBe(recoveryActionAfterFirst?.id);
     expect(recoveryActionAfterRetry?.ownerAgentId).toBe(delegateAgentId);
     expect(recoveryActionAfterRetry?.attemptCount).toBe(2);
+
+    // Let background wakes from the second escalation settle before staging the third strand.
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // === Second delegate strand (CAS-6342 second-retry gap) ===
+    // After ownership transferred to delegate, the delegate itself strands again.
+    // recovery.ownerAgentId == issue.assigneeAgentId == delegate, so detect() returns null
+    // (delegate is in knownOwners). Without the preserve guard, resolveStrandedIssueRecoveryOwnerAgentId
+    // promotes to the delegate's manager, clobbering the visible assignee back to the manager.
+    const secondRetryRunId = randomUUID();
+    const secondRetryStrand = new Date("2999-06-01T00:00:00.000Z");
+
+    await db.insert(heartbeatRuns).values({
+      id: secondRetryRunId,
+      companyId,
+      agentId: delegateAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: secondRetryStrand,
+      finishedAt: secondRetryStrand,
+      createdAt: secondRetryStrand,
+      updatedAt: secondRetryStrand,
+      errorCode: "budget_blocked",
+      error: "Budget exceeded; refusing to dispatch.",
+    });
+
+    // Simulate the delegate picking up and stranding again (status back to in_progress,
+    // then the reconcile fires for the second time with the delegate as assignee).
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        checkoutRunId: secondRetryRunId,
+        startedAt: secondRetryStrand,
+      })
+      .where(eq(issues.id, issueId));
+
+    const thirdResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(thirdResult.escalated).toBe(1);
+    expect(thirdResult.issueIds).toEqual([issueId]);
+
+    const afterSecondRetry = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterSecondRetry?.status).toBe("blocked");
+    // AC: delegate's assignee survives the second recovery retry — must not revert to manager.
+    expect(afterSecondRetry?.assigneeAgentId).toBe(delegateAgentId);
+
+    const recoveryActionAfterSecondRetry = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryActionAfterSecondRetry?.ownerAgentId).toBe(delegateAgentId);
+    expect(recoveryActionAfterSecondRetry?.attemptCount).toBe(3);
   });
 
   it("leaves the productive-but-stranded continuation path unchanged under the new classifier", async () => {
