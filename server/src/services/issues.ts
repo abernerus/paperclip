@@ -5674,6 +5674,93 @@ export function issueService(db: Db) {
       });
     },
 
+    claimReviewLane: async (id: string, agentId: string, checkoutRunId: string | null) => {
+      const issueCompany = await db
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!issueCompany) throw notFound("Issue not found");
+      await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
+
+      const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
+      if (
+        activePauseHold &&
+        !(await isTreeHoldInteractionCheckoutAllowed(issueCompany.companyId, checkoutRunId, activePauseHold))
+      ) {
+        throw conflict("Issue checkout blocked by active subtree pause hold", {
+          issueId: id,
+          holdId: activePauseHold.holdId,
+          rootIssueId: activePauseHold.rootIssueId,
+          mode: activePauseHold.mode,
+          securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+        });
+      }
+
+      await clearExecutionRunIfTerminal(id);
+      await clearCheckoutRunIfTerminal(id);
+
+      const dependencyReadiness = await listIssueDependencyReadinessMap(db, issueCompany.companyId, [id]);
+      const unresolvedBlockerIssueIds = dependencyReadiness.get(id)?.unresolvedBlockerIssueIds ?? [];
+      if (unresolvedBlockerIssueIds.length > 0) {
+        throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
+      }
+
+      const runLockCondition = checkoutRunId
+        ? and(
+          or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId)),
+          or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
+        )
+        : and(isNull(issues.checkoutRunId), isNull(issues.executionRunId));
+      const updated = await db
+        .update(issues)
+        .set({
+          checkoutRunId,
+          executionRunId: checkoutRunId,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issues.id, id),
+            eq(issues.status, "in_review"),
+            eq(issues.assigneeAgentId, agentId),
+            isNull(issues.assigneeUserId),
+            runLockCondition,
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        const [enriched] = await withIssueLabels(db, [updated]);
+        return enriched;
+      }
+
+      const current = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+
+      if (!current) throw notFound("Issue not found");
+
+      throw conflict("Issue checkout conflict", {
+        issueId: current.id,
+        status: current.status,
+        assigneeAgentId: current.assigneeAgentId,
+        assigneeUserId: current.assigneeUserId,
+        checkoutRunId: current.checkoutRunId,
+        executionRunId: current.executionRunId,
+      });
+    },
+
     assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);

@@ -4328,6 +4328,86 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("allows exactly one run to atomically claim an in_review issue lane", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "MasterOfCraft",
+      role: "reviewer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date("2026-07-08T10:00:00.000Z"),
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "timer",
+        startedAt: new Date("2026-07-08T10:00:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review lane race",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const results = await Promise.allSettled([
+      svc.claimReviewLane(issueId, agentId, firstRunId),
+      svc.claimReviewLane(issueId, agentId, secondRunId),
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: expect.objectContaining({ status: 409 }),
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("in_review");
+    expect(row?.assigneeAgentId).toBe(agentId);
+    expect([firstRunId, secondRunId]).toContain(row?.checkoutRunId);
+    expect(row?.executionRunId).toBe(row?.checkoutRunId);
+  });
+
   it("checkout refuses to promote a 'done' issue when 'done' is not in expectedStatuses, even with a lingering executionRunId pointer", async () => {
     // Regression for PR #2482 checkout-adoption review finding: the original
     // patch's stale-executionRunId adoption SQL set `status: 'in_progress'`
