@@ -18,6 +18,7 @@ import {
   resolveNextSessionState,
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
+  shouldAutoCheckoutIssueForWake,
   shouldDeferFollowupWakeForSameIssue,
   stripHostWorkspaceProvisionForLowTrustSandbox,
   stripWorkspaceRuntimeFromExecutionRunConfig,
@@ -878,6 +879,41 @@ describe("shouldResetTaskSessionForWake", () => {
       shouldResetTaskSessionForWake({
         wakeSource: "on_demand",
         wakeTriggerDetail: "callback",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("shouldAutoCheckoutIssueForWake", () => {
+  it("allows issue-assigned review wakes to claim the review lane", () => {
+    expect(
+      shouldAutoCheckoutIssueForWake({
+        contextSnapshot: { wakeReason: "issue_assigned" },
+        issueStatus: "in_review",
+        issueAssigneeAgentId: "agent-1",
+        isDependencyReady: true,
+        agentId: "agent-1",
+      }),
+    ).toBe(true);
+  });
+
+  it("still refuses mention wakes and mismatched assignees", () => {
+    expect(
+      shouldAutoCheckoutIssueForWake({
+        contextSnapshot: { wakeReason: "issue_comment_mentioned" },
+        issueStatus: "in_review",
+        issueAssigneeAgentId: "agent-1",
+        isDependencyReady: true,
+        agentId: "agent-1",
+      }),
+    ).toBe(false);
+    expect(
+      shouldAutoCheckoutIssueForWake({
+        contextSnapshot: { wakeReason: "issue_assigned" },
+        issueStatus: "in_review",
+        issueAssigneeAgentId: "agent-1",
+        isDependencyReady: true,
+        agentId: "agent-2",
       }),
     ).toBe(false);
   });
