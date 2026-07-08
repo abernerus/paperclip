@@ -4380,8 +4380,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     const results = await Promise.allSettled([
-      svc.checkout(issueId, agentId, ["in_review"], firstRunId),
-      svc.checkout(issueId, agentId, ["in_review"], secondRunId),
+      svc.claimReviewLane(issueId, agentId, firstRunId),
+      svc.claimReviewLane(issueId, agentId, secondRunId),
     ]);
 
     const fulfilled = results.filter((result) => result.status === "fulfilled");
@@ -4402,7 +4402,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(row?.status).toBe("in_progress");
+    expect(row?.status).toBe("in_review");
     expect(row?.assigneeAgentId).toBe(agentId);
     expect([firstRunId, secondRunId]).toContain(row?.checkoutRunId);
     expect(row?.executionRunId).toBe(row?.checkoutRunId);
