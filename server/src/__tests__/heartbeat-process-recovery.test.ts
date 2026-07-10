@@ -3035,6 +3035,125 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("keeps setup_failed recovery on the source assignee instead of the assignee's manager (CAS-9299)", async () => {
+    const companyId = randomUUID();
+    const ceoAgentId = randomUUID();
+    const ctoAgentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const failedAt = new Date("2026-07-10T11:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: ceoAgentId,
+        companyId,
+        name: "Chancellor",
+        role: "ceo",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: ctoAgentId,
+        companyId,
+        name: "Master of Craft",
+        role: "cto",
+        status: "idle",
+        reportsTo: ceoAgentId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: ctoAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: failedAt,
+      finishedAt: failedAt,
+      createdAt: failedAt,
+      updatedAt: failedAt,
+      errorCode: "setup_failed",
+      error: "Failed query: insert into environments on conflict",
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Master's Rounds",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ctoAgentId,
+      checkoutRunId: runId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: failedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.assigneeAgentId).toBe(ctoAgentId);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .then((rows) => rows[0] ?? null);
+    expect(action).toMatchObject({
+      kind: "platform_setup",
+      cause: "setup_failed",
+      ownerType: "agent",
+      ownerAgentId: ctoAgentId,
+      previousOwnerAgentId: ctoAgentId,
+      returnOwnerAgentId: ctoAgentId,
+      status: "active",
+    });
+    expect(action?.ownerAgentId).not.toBe(ceoAgentId);
+    expect(action?.wakePolicy).toMatchObject({
+      type: "manual_repair_required",
+      reason: "setup_failed",
+      ownerAgentId: ctoAgentId,
+    });
+    expect(action?.nextAction).toContain("platform setup/provisioning failure");
+    expect(action?.evidence).toMatchObject({
+      sourceIssueId: issueId,
+      latestRunId: runId,
+      latestRunErrorCode: "setup_failed",
+      recoveryCause: "setup_failed",
+    });
+
+    const ownerWakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, ctoAgentId));
+    expect(ownerWakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("platform setup failure");
+    expect(comments[0]?.body).toContain("setup_failed");
+  });
+
   it("keeps a manually delegated assignee on a blocked issue across stranded recovery retries (CAS-6342)", async () => {
     // CAS-6342: when an officer manually delegates a blocked issue that carries an
     // active stranded_assigned_issue recovery to a different invokable agent, recovery
