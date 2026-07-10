@@ -230,6 +230,9 @@ function platformSetupRecoveryCauseForRun(latestRun: LatestIssueRun): Extract<St
 }
 
 function isManualRepairRecoveryCause(cause: StrandedRecoveryCause) {
+  // These failures happen before safe agent work can resume. Keep ownership on
+  // the source assignee for manual repair instead of treating them as agent
+  // stalls that should climb the org chart.
   return cause === "workspace_validation_failed" || cause === "setup_failed";
 }
 
@@ -2380,7 +2383,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // 2. Existing owner matches current assignee and is still valid: keep them — do not
     //    let resolveStrandedIssueRecoveryOwnerAgentId promote to their manager on a
     //    second (or later) strand.
-    // 3. Fresh escalation: use the manager / creator / executive chain.
+    // 3. Fresh genuine agent-stall escalation: use the manager / creator /
+    //    executive chain. A CTO's stranded_assigned_issue can still climb to
+    //    CEO by design; manual setup/workspace repair causes are handled above.
     const ownerAgentId = isManualRepairRecoveryCause(recoveryCause)
       ? await resolveManualRepairRecoveryOwnerAgentId(input.issue)
       : delegateOwnerAgentId
