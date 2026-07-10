@@ -334,6 +334,23 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+#### Recovery action resolution authority
+
+Resolving an explicit recovery action is a privileged operation, because a resolution can return a stalled source issue to a live path or close it out. `POST /api/issues/:id/recovery-actions/resolve` therefore mediates the caller through three independent checks, in order:
+
+1. **Company and issue boundary.** The actor must be able to reach the source issue inside its own company and authorization boundary. An actor outside that boundary is rejected before any recovery logic runs, with `403 "Issue is outside this actor's authorization boundary"`. This check is independent of recovery ownership and always applies.
+
+2. **Recovery-owner authority.** This gate applies only to agent actors; a board or user actor passes it. An agent may resolve a recovery action only when it is the source issue's current assignee, the recovery action's recorded owner, or an agent holding an active checkout-management override for one of those. Any other agent is rejected with `403 "Agent cannot resolve another owner's recovery action"`. This is deliberate least privilege: a peer agent must not clear a recovery shell it does not own.
+
+3. **Board-privileged outcomes.** The `cancelled` and `false_positive` outcomes require a board actor. An owning agent may close its own action with a restorative outcome (for example `restored`, `delegated`, `blocked`, or `escalated`) together with the source status it is returning the issue to, but cancelling a shell or recording it as a false positive is a board-ops action.
+
+The intended resolution path follows from these checks:
+
+- A **named recovery owner** clears its own stranded shell with a live disposition — returning the source issue to `todo`, recording `restored`/`blocked`, or delegating follow-up — using genuine Paperclip agent authentication. No board actor is required, and the owner never impersonates anyone.
+- A **board operator** clears a shell that no single agent owns, a shell stranded onto a different owner (for example one escalated to a manager via `reportsTo`), or any `cancelled`/`false_positive` disposition. The board actor bypasses the owner gate as a first-class actor rather than by impersonating the recorded owner.
+
+Board-ops resolution runs through the audited `cxr issue recovery resolve <issue> --outcome <outcome> --source-status <status> --as board` route. `--as board` authenticates as the board, so it passes both the owner gate and the board-outcome check, and every resolution is written to the activity log (`issue.recovery_action_resolved`, plus `issue.updated` when the source status changes) so the cleanup keeps an audit trail. Officer or agent aliases are intentionally rejected on the owner gate when they are neither the assignee nor the recorded owner; board-adjacent cleanup must run as board, not as an impersonated officer.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.
