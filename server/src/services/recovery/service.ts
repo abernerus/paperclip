@@ -119,6 +119,7 @@ type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeed
 type StrandedRecoveryCause =
   | "stranded_assigned_issue"
   | "workspace_validation_failed"
+  | "setup_failed"
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type SuccessfulRunHandoffRecoveryEvidence = {
@@ -222,6 +223,14 @@ function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRet
     baseBackoffMs: 0,
     errorCode,
   };
+}
+
+function platformSetupRecoveryCauseForRun(latestRun: LatestIssueRun): Extract<StrandedRecoveryCause, "setup_failed"> | null {
+  return readNonEmptyString(latestRun?.errorCode) === "setup_failed" ? "setup_failed" : null;
+}
+
+function isManualRepairRecoveryCause(cause: StrandedRecoveryCause) {
+  return cause === "workspace_validation_failed" || cause === "setup_failed";
 }
 
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
@@ -2231,6 +2240,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ? "missing_disposition" as const
       : cause === "workspace_validation_failed"
         ? "workspace_validation" as const
+      : cause === "setup_failed"
+        ? "platform_setup" as const
       : "stranded_assigned_issue" as const;
   }
 
@@ -2333,6 +2344,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return existingAction.ownerAgentId;
   }
 
+  async function resolveManualRepairRecoveryOwnerAgentId(issue: typeof issues.$inferSelect): Promise<string | null> {
+    const assigneeAgentId = issue.assigneeAgentId;
+    if (!assigneeAgentId) return null;
+
+    const assignee = await getAgent(assigneeAgentId);
+    if (!assignee || assignee.companyId !== issue.companyId) return null;
+    if (!(await isAgentInvokable(assignee))) return null;
+    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, assignee.id, {
+      issueId: issue.id,
+      projectId: issue.projectId,
+    });
+    if (budgetBlock) return null;
+    return assignee.id;
+  }
+
   async function ensureSourceScopedStrandedRecoveryAction(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -2355,9 +2381,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     //    let resolveStrandedIssueRecoveryOwnerAgentId promote to their manager on a
     //    second (or later) strand.
     // 3. Fresh escalation: use the manager / creator / executive chain.
-    const ownerAgentId = delegateOwnerAgentId
-      ?? await preserveRecoveryOwnerIfMatchesAssignee(existingAction, input.issue)
-      ?? await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const ownerAgentId = isManualRepairRecoveryCause(recoveryCause)
+      ? await resolveManualRepairRecoveryOwnerAgentId(input.issue)
+      : delegateOwnerAgentId
+        ?? await preserveRecoveryOwnerIfMatchesAssignee(existingAction, input.issue)
+        ?? await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
@@ -2383,11 +2411,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "workspace_validation_failed"
           ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
+        : recoveryCause === "setup_failed"
+          ? "Repair the platform setup/provisioning failure before resuming adapter execution."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-      wakePolicy: recoveryCause === "workspace_validation_failed"
+      wakePolicy: isManualRepairRecoveryCause(recoveryCause)
         ? {
           type: "manual_repair_required",
-          reason: "workspace_validation_failed",
+          reason: recoveryCause,
           ownerAgentId,
         }
         : ownerAgentId
@@ -2414,7 +2444,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
   }) {
-    if (input.recoveryCause === "workspace_validation_failed") return;
+    if (isManualRepairRecoveryCause(input.recoveryCause)) return;
     if (!input.action.ownerAgentId) return;
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
@@ -2620,7 +2650,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
-      input.recoveryCause === "workspace_validation_failed";
+      isManualRepairRecoveryCause(recoveryCause);
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
@@ -2674,6 +2704,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ? "recovery.reconcile_successful_run_handoff_missing_state"
           : input.recoveryCause === "workspace_validation_failed"
             ? "recovery.reconcile_workspace_validation_failed"
+          : input.recoveryCause === "setup_failed"
+            ? "recovery.reconcile_platform_setup_failed"
           : "recovery.reconcile_stranded_assigned_issue",
         recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
         latestRunId: input.latestRun?.id ?? null,
@@ -2947,6 +2979,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
+        const platformSetupCause = platformSetupRecoveryCauseForRun(latestRun);
+        if (platformSetupCause) {
+          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: platformSetupCause,
+            comment:
+              "Paperclip detected a platform setup failure before adapter execution " +
+              `(\`${platformSetupCause}\`). Skipping org-chart escalation and moving it to \`blocked\` ` +
+              `for manual platform repair.${failureSummary ?? ""}`,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
         const classification = classifyContinuationFailure(latestRun);
 
         if (classification.kind === "non_retryable") {

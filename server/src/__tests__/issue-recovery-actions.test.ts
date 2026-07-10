@@ -324,6 +324,59 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("keeps platform setup failures on the source assignee instead of escalating to their manager", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "environment insert failed",
+      errorCode: "setup_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      recoveryCause: "setup_failed",
+      comment: "Platform setup failed before the adapter ran.",
+    });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      companyId,
+      kind: "platform_setup",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "setup_failed",
+      attemptCount: 1,
+    });
+    expect(actionRows[0]?.ownerAgentId).not.toBe(managerId);
+    expect(actionRows[0]?.wakePolicy).toMatchObject({
+      type: "manual_repair_required",
+      reason: "setup_failed",
+      ownerAgentId: coderId,
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);
