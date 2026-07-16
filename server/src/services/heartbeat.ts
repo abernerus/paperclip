@@ -2211,7 +2211,7 @@ export function stripConfiguredModelFromSessionParams(
   return next;
 }
 
-function shouldAutoCheckoutIssueForWake(input: {
+export function shouldAutoCheckoutIssueForWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
@@ -2236,6 +2236,9 @@ function shouldAutoCheckoutIssueForWake(input: {
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
+  // A child-completed wake informs the assignee but must not auto-promote a blocked
+  // parent. The external blocker is still live; only the assignee clears it explicitly.
+  if (wakeReason === "issue_children_completed" && issueStatus === "blocked") return false;
 
   return true;
 }
