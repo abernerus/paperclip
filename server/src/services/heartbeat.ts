@@ -5532,6 +5532,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "retry_exhausted" as const, queuedRun: null };
     }
 
+    if (deriveCommentId(contextSnapshot, null)) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Run ended without an issue comment; wake already responds to an issue comment",
+      });
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     if (!shouldRequireIssueCommentForWake(contextSnapshot)) {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
