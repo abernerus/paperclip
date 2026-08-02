@@ -4,13 +4,14 @@ description: >
   Build Paperclip issue interaction UI; use for frontend components, pages, actions, and state around issue comments, status, and agent activity.
 ---
 
-# Create a new issue-thread interaction UI (developer skill)
+# Create a new issue-thread interaction UI (Developer/maintainer skill)
 
 This skill walks a Paperclip contributor through introducing a new issue-thread
 interaction kind from shared contract to issue-detail wiring, helpers, and
 docs. It is intentionally a developer/maintainer skill: the audience is a
 human or coding agent making code changes inside `paperclipai/paperclip`, not
 the operational agents that run inside a deployed Paperclip company.
+Do NOT install this on production Paperclip agents.
 
 ## When to use
 
