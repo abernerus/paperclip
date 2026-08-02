@@ -844,9 +844,12 @@ export async function startServer(): Promise<StartedServer> {
         });
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
+      // persisted queued work is still being driven forward. Execution-lock
+      // renewal runs first so live runs never look stale to the recovery passes
+      // that follow (CAS-10256).
       void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+        .renewExecutionLocksForLiveRuns()
+        .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();

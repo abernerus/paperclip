@@ -236,6 +236,11 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+// CAS-10256: a "running" execution-lock holder has its lock renewed every
+// scheduler tick while its host instance is alive (renewExecutionLocksForLiveRuns).
+// A running holder whose lock is older than this is presumed dead and its lock
+// may be explicitly taken over at claim time.
+export const EXECUTION_LOCK_STALE_MS = 5 * 60 * 1000;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -3128,6 +3133,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return runningProcesses.has(id) || activeRunExecutions.has(id);
     },
   };
+
+  // CAS-10256: liveness test for an issue's execution-lock holder. A queued or
+  // scheduled_retry holder is governed by status alone (it is not executing, so
+  // it cannot renew). A "running" holder must either be tracked in-memory by
+  // this instance or hold a lock renewed within EXECUTION_LOCK_STALE_MS —
+  // otherwise its owner is presumed dead and the lock is stale.
+  function isExecutionLockFresh(lockedAt: Date | string | null | undefined, now = new Date()) {
+    if (!lockedAt) return false;
+    return now.getTime() - new Date(lockedAt).getTime() < EXECUTION_LOCK_STALE_MS;
+  }
+
+  function isLiveExecutionLockHolder(
+    holder: { id: string; status: string } | null | undefined,
+    lockedAt: Date | string | null | undefined,
+    now = new Date(),
+  ) {
+    if (!holder) return false;
+    if (
+      !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
+        holder.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
+      )
+    ) {
+      return false;
+    }
+    if (holder.status !== "running") return true;
+    return liveRunExecutions.has(holder.id) || isExecutionLockFresh(lockedAt, now);
+  }
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -6814,11 +6846,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
-        await cancelQueuedRunForStaleIssue(run, issueId, staleness);
-        logger.info(
-          { runId: run.id, issueId, errorCode: staleness.errorCode },
-          "claimQueuedRun: cancelled stale queued run",
-        );
+        if (staleness.errorCode === "issue_execution_lock_held") {
+          await parkRunForHeldExecutionLock(run, issueId, staleness);
+          logger.warn(
+            { runId: run.id, issueId, ...staleness.details },
+            "claimQueuedRun: parked queued run behind a live execution-lock holder",
+          );
+        } else {
+          await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+          logger.info(
+            { runId: run.id, issueId, errorCode: staleness.errorCode },
+            "claimQueuedRun: cancelled stale queued run",
+          );
+        }
         return null;
       }
     }
@@ -6857,12 +6897,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
     // not at queue time. Guard is idempotent — safe if called more than once.
+    //
+    // CAS-10256: the stamp is no longer advisory for assignee runs. If the lock
+    // is held by another run we either take it over explicitly (dead holder,
+    // recorded in the activity log) or stand the run down and park its wake —
+    // an assignee executor never proceeds without owning the lock.
     const claimedContext = parseObject(claimed.contextSnapshot);
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
+      const stamped = await db
         .update(issues)
         .set({
           executionRunId: claimed.id,
@@ -6879,7 +6924,132 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.assigneeAgentId, claimed.agentId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
-        );
+        )
+        .returning({ id: issues.id });
+
+      if (stamped.length === 0) {
+        const lockState = await db
+          .select({
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+            executionLockedAt: issues.executionLockedAt,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
+          .then((rows) => rows[0] ?? null);
+
+        // Only the assignee competes for the execution lock; mention/context
+        // runs may still proceed unlocked (unchanged behavior).
+        if (
+          lockState &&
+          lockState.assigneeAgentId === claimed.agentId &&
+          lockState.executionRunId &&
+          lockState.executionRunId !== claimed.id
+        ) {
+          const holder = await db
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              agentId: heartbeatRuns.agentId,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, lockState.executionRunId))
+            .then((rows) => rows[0] ?? null);
+
+          const standDown = async () => {
+            await parkRunForHeldExecutionLock(claimed, claimedIssueId, {
+              stale: true,
+              errorCode: "issue_execution_lock_held",
+              reason:
+                "Stood down because another live run holds the issue execution lock; the wake will be re-delivered when that run finalizes",
+              details: {
+                issueId: claimedIssueId,
+                holderRunId: lockState.executionRunId,
+                holderRunStatus: holder?.status ?? null,
+                holderAgentId: holder?.agentId ?? null,
+                executionLockedAt: lockState.executionLockedAt
+                  ? new Date(lockState.executionLockedAt).toISOString()
+                  : null,
+              },
+            });
+            logger.warn(
+              { runId: claimed.id, issueId: claimedIssueId, holderRunId: lockState.executionRunId },
+              "claimQueuedRun: stood down claimed run — execution lock held by a live run",
+            );
+          };
+
+          if (isLiveExecutionLockHolder(holder, lockState.executionLockedAt)) {
+            await standDown();
+            return null;
+          }
+
+          // Stale holder — take the lock over explicitly and leave a record.
+          const takenOver = await db
+            .update(issues)
+            .set({
+              executionRunId: claimed.id,
+              executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+              executionLockedAt: claimedAt,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, claimedIssueId),
+                eq(issues.companyId, claimed.companyId),
+                eq(issues.assigneeAgentId, claimed.agentId),
+                eq(issues.executionRunId, lockState.executionRunId),
+              ),
+            )
+            .returning({ id: issues.id });
+
+          if (takenOver.length === 0) {
+            // Lost the takeover race; if we still do not own the lock, stand down.
+            const reread = await db
+              .select({ executionRunId: issues.executionRunId })
+              .from(issues)
+              .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
+              .then((rows) => rows[0] ?? null);
+            if (reread?.executionRunId !== claimed.id) {
+              await standDown();
+              return null;
+            }
+          } else {
+            const takeoverDetails = {
+              issueId: claimedIssueId,
+              previousExecutionRunId: lockState.executionRunId,
+              previousExecutionLockedAt: lockState.executionLockedAt
+                ? new Date(lockState.executionLockedAt).toISOString()
+                : null,
+              previousHolderStatus: holder?.status ?? "missing",
+              newExecutionRunId: claimed.id,
+              takenOverAt: claimedAt.toISOString(),
+              source: "heartbeat.claim_queued_run",
+            };
+            await logActivity(db, {
+              companyId: claimed.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId: claimed.agentId,
+              runId: claimed.id,
+              action: "issue.execution_lock_takeover",
+              entityType: "issue",
+              entityId: claimedIssueId,
+              details: takeoverDetails,
+            });
+            await appendRunEvent(claimed, await nextRunEventSeq(claimed.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: `Took over stale issue execution lock from run ${lockState.executionRunId}`,
+              payload: takeoverDetails,
+            });
+            logger.warn(
+              { runId: claimed.id, ...takeoverDetails },
+              "claimQueuedRun: took over stale issue execution lock",
+            );
+          }
+        }
+      }
     }
 
     return claimed;
@@ -6954,6 +7124,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_terminal_status"
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
+          | "issue_execution_lock_held"
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
@@ -6970,6 +7141,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
         executionState: issues.executionState,
       })
       .from(issues)
@@ -7068,6 +7240,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // CAS-10256: refuse to start a second executor while another live run holds
+    // the issue execution lock. The caller parks the run (deferred wake, not
+    // dropped) so it is re-delivered when the holder finalizes. Stale holders —
+    // terminal, missing, or a "running" owner that stopped renewing its lock —
+    // fall through: claimQueuedRun performs an explicit, recorded takeover.
+    if (
+      issue.executionRunId &&
+      issue.executionRunId !== run.id &&
+      retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
+    ) {
+      const holder = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          agentId: heartbeatRuns.agentId,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, issue.executionRunId))
+        .then((rows) => rows[0] ?? null);
+      if (isLiveExecutionLockHolder(holder, issue.executionLockedAt)) {
+        return {
+          stale: true,
+          errorCode: "issue_execution_lock_held",
+          reason:
+            "Parked because another live run already holds the issue execution lock; the wake will be re-delivered when that run finalizes",
+          details: {
+            issueId,
+            holderRunId: holder?.id ?? issue.executionRunId,
+            holderRunStatus: holder?.status ?? null,
+            holderAgentId: holder?.agentId ?? null,
+            executionLockedAt: issue.executionLockedAt
+              ? new Date(issue.executionLockedAt).toISOString()
+              : null,
+          },
+        };
+      }
+    }
+
     if (issue.status === "in_review") {
       const executionState = parseIssueExecutionState(issue.executionState);
       const currentParticipant = executionState?.currentParticipant ?? null;
@@ -7134,6 +7344,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issues.executionRunId, run.id),
         ),
       );
+
+    await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: staleness.reason,
+      payload: staleness.details,
+    });
+
+    return cancelled;
+  }
+
+  // CAS-10256: stand a run down because another live run holds the issue
+  // execution lock — but park its wake instead of dropping it, so
+  // releaseIssueExecutionAndPromote re-delivers the trigger when the holder
+  // finalizes. Works for runs that are still queued and for runs that were
+  // already flipped to running before the lock conflict was detected.
+  async function parkRunForHeldExecutionLock(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    staleness: Extract<QueuedRunStaleness, { stale: true }>,
+  ) {
+    const now = new Date();
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: now,
+      error: staleness.reason,
+      errorCode: staleness.errorCode,
+      resultJson: {
+        ...parseObject(run.resultJson),
+        stopReason: staleness.errorCode,
+        effectiveTimeoutSec: 0,
+        timeoutConfigured: false,
+        timeoutSource: "execution_lock_gate",
+        timeoutFired: false,
+      },
+    });
+    if (!cancelled) return null;
+
+    if (run.wakeupRequestId) {
+      const existingDeferred = await db
+        .select({
+          id: agentWakeupRequests.id,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, run.companyId),
+            eq(agentWakeupRequests.agentId, run.agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (existingDeferred) {
+        // A deferred wake for this issue+agent already exists; coalesce into it.
+        await setWakeupStatus(run.wakeupRequestId, "skipped", {
+          finishedAt: now,
+          error: staleness.reason,
+        });
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, existingDeferred.id));
+      } else {
+        const wakeup = await db
+          .select({ payload: agentWakeupRequests.payload })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, run.wakeupRequestId))
+          .then((rows) => rows[0] ?? null);
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            status: "deferred_issue_execution",
+            payload: {
+              ...parseObject(wakeup?.payload),
+              issueId,
+              [DEFERRED_WAKE_CONTEXT_KEY]: parseObject(run.contextSnapshot),
+            },
+            finishedAt: null,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+      }
+    }
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -7567,6 +7868,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
+  }
+
+  // CAS-10256: renew the execution lock for every run this server instance is
+  // actively supervising, so a lock whose owner died (server crash, lost
+  // process handle) becomes detectably stale after EXECUTION_LOCK_STALE_MS
+  // instead of indefinitely blocking — or silently permitting — dispatch.
+  // Called on every scheduler tick.
+  async function renewExecutionLocksForLiveRuns(now = new Date()) {
+    const liveRunIds = [...new Set([...runningProcesses.keys(), ...activeRunExecutions])];
+    if (liveRunIds.length === 0) return { renewed: 0 };
+    const liveRunningIds = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(inArray(heartbeatRuns.id, liveRunIds), eq(heartbeatRuns.status, "running")))
+      .then((rows) => rows.map((row) => row.id));
+    if (liveRunningIds.length === 0) return { renewed: 0 };
+    const renewed = await db
+      .update(issues)
+      .set({ executionLockedAt: now })
+      .where(inArray(issues.executionRunId, liveRunningIds))
+      .returning({ id: issues.id });
+    return { renewed: renewed.length };
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -11472,6 +11795,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     sweepStaleIssueLocks,
+
+    renewExecutionLocksForLiveRuns,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
