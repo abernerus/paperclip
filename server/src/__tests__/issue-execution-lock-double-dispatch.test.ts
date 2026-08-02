@@ -437,4 +437,91 @@ describeEmbeddedPostgres("issue execution-lock double-dispatch prevention (CAS-1
       .then((rows) => rows[0]);
     expect(lock.executionRunId).toBe(liveRunId);
   });
+
+  it("CAS-10194 pattern: queued continuation holds the lock without heartbeating — no takeover, sibling dispatch parks", async () => {
+    // Live repro from 2026-08-02 (Artificer run ed3a7c67, CAS-10256 comment
+    // 2fa5dd11): the D3 owner timed out and its continuation became the
+    // issue's executionRunId while still queued (startedAt null). A queued
+    // holder cannot renew the lock, so its executionLockedAt goes clock-stale
+    // — but it is still the legitimate next executor and its worktree held an
+    // hour of uncommitted WIP. Liveness must be governed by status alone for
+    // non-running holders: no takeover, and a rival dispatch parks.
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
+
+    const queuedHolderId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedHolderId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "assignment",
+      startedAt: null,
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Queued continuation holds lock — rival must park, never take over",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: queuedHolderId,
+      // Clock-stale: inherited from the dead prior owner, never renewed.
+      executionLockedAt: new Date(Date.now() - EXECUTION_LOCK_STALE_MS * 2),
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({ companyId, agentId, issueId });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run.status).toBe("cancelled");
+    expect(run.errorCode).toBe("issue_execution_lock_held");
+    const executeCallsForRun = (
+      mockAdapterExecute.mock.calls as unknown as Array<[{ runId?: string } | undefined]>
+    ).filter(([context]) => context?.runId === runId);
+    expect(executeCallsForRun).toHaveLength(0);
+
+    const wakeup = await db
+      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]);
+    expect(wakeup.status).toBe("deferred_issue_execution");
+    expect((wakeup.payload as { issueId?: string }).issueId).toBe(issueId);
+
+    // The queued continuation keeps the lock despite its stale timestamp —
+    // no explicit takeover was recorded because none happened.
+    const lock = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock.executionRunId).toBe(queuedHolderId);
+
+    const takeovers = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.execution_lock_takeover"),
+        ),
+      );
+    expect(takeovers).toHaveLength(0);
+  });
 });
