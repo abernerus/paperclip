@@ -13,6 +13,7 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  checkout: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
   getAttachmentById: vi.fn(),
@@ -342,6 +343,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.checkout.mockReset();
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.getAttachmentById.mockReset();
@@ -425,6 +427,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.checkout.mockResolvedValue(makeIssue());
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -563,6 +566,74 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
       action: "issue:read",
     }));
+  });
+
+  it("passes a strict foreign-lane filter for broad agent issue lists", async () => {
+    const app = await createApp(ownerActor(), createRunContextDb({}, ownerAgentId, ownerRunId));
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({
+        assigneeAgentId: ownerAgentId,
+        status: "todo,in_progress,in_review,blocked",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.list).toHaveBeenCalledWith(companyId, expect.objectContaining({
+      assigneeAgentId: ownerAgentId,
+      status: "todo,in_progress,in_review,blocked",
+      excludeForeignLiveLaneOwnerForRunId: ownerRunId,
+      excludeForeignLaneOwnerForRunId: ownerRunId,
+    }));
+  });
+
+  it("keeps issue-scoped agent issue lists on the live-owner filter only", async () => {
+    const app = await createApp(ownerActor(), createRunContextDb({ issueId }, ownerAgentId, ownerRunId));
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({
+        assigneeAgentId: ownerAgentId,
+        status: "todo,in_progress,in_review,blocked",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.list).toHaveBeenCalledWith(companyId, expect.objectContaining({
+      assigneeAgentId: ownerAgentId,
+      status: "todo,in_progress,in_review,blocked",
+      excludeForeignLiveLaneOwnerForRunId: ownerRunId,
+      excludeForeignLaneOwnerForRunId: undefined,
+    }));
+  });
+
+  it("marks broad agent checkout attempts as ineligible for implicit foreign-lane recovery", async () => {
+    const app = await createApp(ownerActor(), createRunContextDb({}, ownerAgentId, ownerRunId));
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: ownerAgentId, expectedStatuses: ["todo", "in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      ownerAgentId,
+      ["todo", "in_progress"],
+      ownerRunId,
+      { rejectForeignLaneRecovery: true },
+    );
+  });
+
+  it("allows issue-scoped agent checkout attempts to use audited stale-lane recovery", async () => {
+    const app = await createApp(ownerActor(), createRunContextDb({ issueId }, ownerAgentId, ownerRunId));
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: ownerAgentId, expectedStatuses: ["todo", "in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      ownerAgentId,
+      ["todo", "in_progress"],
+      ownerRunId,
+      { rejectForeignLaneRecovery: false },
+    );
   });
 
   it.each([

@@ -1959,6 +1959,20 @@ export function issueRoutes(
     return run;
   }
 
+  function readIssueIdFromRunContext(contextSnapshot: unknown) {
+    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+    const context = contextSnapshot as Record<string, unknown>;
+    const paperclipIssue = context.paperclipIssue && typeof context.paperclipIssue === "object" && !Array.isArray(context.paperclipIssue)
+      ? context.paperclipIssue as Record<string, unknown>
+      : null;
+    return readNonEmptyString(context.issueId) ?? readNonEmptyString(paperclipIssue?.id);
+  }
+
+  async function loadActorRunIssueId(req: Request, companyId: string) {
+    const run = await loadActorRunContext(req, companyId);
+    return run ? readIssueIdFromRunContext(run.contextSnapshot) : null;
+  }
+
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -2509,6 +2523,18 @@ export function issueRoutes(
       }
     }
     const offset = parsedOffset ?? 0;
+    const actorRunIssueId = await loadActorRunIssueId(req, companyId);
+    const excludeForeignLiveLaneOwnerForRunId =
+      req.actor.type === "agent" &&
+      assigneeAgentId === req.actor.agentId
+        ? req.actor.runId?.trim() || null
+        : undefined;
+    const excludeForeignLaneOwnerForRunId =
+      req.actor.type === "agent" &&
+      assigneeAgentId === req.actor.agentId &&
+      !actorRunIssueId
+        ? req.actor.runId?.trim() || null
+        : undefined;
 
     const rawResult = await svc.list(companyId, {
       attention: attention === "blocked" ? "blocked" : undefined,
@@ -2537,6 +2563,8 @@ export function issueRoutes(
       includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
+      excludeForeignLiveLaneOwnerForRunId,
+      excludeForeignLaneOwnerForRunId,
       hasPlanDocument,
       q: req.query.q as string | undefined,
       limit,
@@ -5894,7 +5922,10 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    const actorRunIssueId = await loadActorRunIssueId(req, issue.companyId);
+    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
+      rejectForeignLaneRecovery: req.actor.type === "agent" && actorRunIssueId !== id,
+    });
     const actor = getActorInfo(req);
 
     await logActivity(db, {

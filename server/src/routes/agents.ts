@@ -625,6 +625,21 @@ export function agentRoutes(
     });
   }
 
+  async function loadCurrentActorRunIssueId(req: Request, companyId: string, agentId: string) {
+    if (req.actor.type !== "agent" || !req.actor.runId) return null;
+    const run = await db
+      .select({
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, req.actor.runId), eq(heartbeatRuns.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!run || run.agentId !== agentId) return null;
+    return readRunIssueId(readObject(run.contextSnapshot));
+  }
+
   function buildLowTrustSelfView(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
     return {
       id: agent.id,
@@ -1918,10 +1933,13 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
+    const actorRunIssueId = await loadCurrentActorRunIssueId(req, req.actor.companyId, req.actor.agentId);
     const rows = await issuesSvc.list(req.actor.companyId, {
       assigneeAgentId: req.actor.agentId,
       status: "todo,in_progress,blocked",
       includeRoutineExecutions: true,
+      excludeForeignLiveLaneOwnerForRunId: req.actor.runId?.trim() || null,
+      excludeForeignLaneOwnerForRunId: actorRunIssueId ? undefined : req.actor.runId?.trim() || null,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
     });
     const issueIds = rows.map((issue) => issue.id);

@@ -209,6 +209,225 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     };
   }
 
+  it("filters foreign issue lanes from broad agent selection lists", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    const currentBroadRunId = randomUUID();
+    const liveReviewRunId = randomUUID();
+    const scheduledRetryRunId = randomUUID();
+    const terminalRunId = randomUUID();
+    const freeIssueId = randomUUID();
+    const liveReviewIssueId = randomUUID();
+    const scheduledIssueId = randomUUID();
+    const staleIssueId = randomUUID();
+    const ownIssueId = randomUUID();
+
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "MasterOfCraft",
+    }));
+    await db.insert(heartbeatRuns).values([
+      {
+        id: currentBroadRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "timer",
+        contextSnapshot: {},
+        startedAt: new Date("2026-08-06T10:26:00.000Z"),
+      },
+      {
+        id: liveReviewRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId: liveReviewIssueId },
+        startedAt: new Date("2026-08-06T10:29:00.000Z"),
+      },
+      {
+        id: scheduledRetryRunId,
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId: scheduledIssueId },
+        scheduledRetryAt: new Date("2026-08-06T10:34:00.000Z"),
+      },
+      {
+        id: terminalRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId: staleIssueId },
+        finishedAt: new Date("2026-08-06T10:33:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: freeIssueId,
+        companyId,
+        title: "Free todo",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: liveReviewIssueId,
+        companyId,
+        title: "Live review lane",
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: liveReviewRunId,
+        executionRunId: liveReviewRunId,
+      },
+      {
+        id: scheduledIssueId,
+        companyId,
+        title: "Scheduled retry lane",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: scheduledRetryRunId,
+        executionRunId: scheduledRetryRunId,
+      },
+      {
+        id: staleIssueId,
+        companyId,
+        title: "Terminal prior lane",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: terminalRunId,
+        executionRunId: terminalRunId,
+      },
+      {
+        id: ownIssueId,
+        companyId,
+        title: "Own current lane",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: currentBroadRunId,
+        executionRunId: currentBroadRunId,
+      },
+    ]);
+
+    const issueScopedLikeList = await svc.list(companyId, {
+      assigneeAgentId: agentId,
+      status: "todo,in_progress,in_review,blocked",
+      excludeForeignLiveLaneOwnerForRunId: currentBroadRunId,
+    });
+    expect(issueScopedLikeList.map((issue) => issue.id).sort()).toEqual([
+      freeIssueId,
+      ownIssueId,
+      staleIssueId,
+    ].sort());
+
+    const broadList = await svc.list(companyId, {
+      assigneeAgentId: agentId,
+      status: "todo,in_progress,in_review,blocked",
+      excludeForeignLaneOwnerForRunId: currentBroadRunId,
+    });
+    expect(broadList.map((issue) => issue.id).sort()).toEqual([
+      freeIssueId,
+      ownIssueId,
+    ].sort());
+  });
+
+  it("refuses and records broad checkout attempts against stale foreign lane owners", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    const broadRunId = randomUUID();
+    const completedReviewRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "MasterOfCraft",
+    }));
+    await db.insert(heartbeatRuns).values([
+      {
+        id: broadRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "timer",
+        contextSnapshot: {},
+        startedAt: new Date("2026-08-06T10:26:00.000Z"),
+      },
+      {
+        id: completedReviewRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-08-06T10:29:00.000Z"),
+        finishedAt: new Date("2026-08-06T10:33:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review lane already completed",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: completedReviewRunId,
+      executionRunId: completedReviewRunId,
+      executionAgentNameKey: "masterofcraft",
+      executionLockedAt: new Date("2026-08-06T10:29:00.000Z"),
+    });
+
+    await expect(
+      svc.checkout(issueId, agentId, ["todo", "in_progress"], broadRunId, {
+        rejectForeignLaneRecovery: true,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict: stale foreign lane owner requires audited recovery",
+      details: expect.objectContaining({
+        laneOwnerState: "stale_or_missing_lane_owner",
+        forceReleaseRecommended: true,
+        operatorMessage: expect.stringContaining("audited recovery path"),
+      }),
+    });
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: completedReviewRunId,
+      executionRunId: completedReviewRunId,
+    });
+
+    const audit = await db
+      .select({
+        action: activityLog.action,
+        runId: activityLog.runId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows[0]);
+    expect(audit).toMatchObject({
+      action: "issue.foreign_lane_checkout_refused",
+      runId: broadRunId,
+      details: expect.objectContaining({
+        laneOwnerState: "stale_or_missing_lane_owner",
+        forceReleaseRecommended: true,
+      }),
+    });
+  });
+
   it("rejects direct terminated assignees with structured conflict details", async () => {
     const companyId = await seedAssignableAgentCompany();
     const terminatedAgentId = randomUUID();
