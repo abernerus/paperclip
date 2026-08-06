@@ -942,6 +942,64 @@ export function routineService(
     return run;
   }
 
+  async function recordFailedScheduleRun(input: {
+    routine: typeof routines.$inferSelect;
+    trigger: typeof routineTriggers.$inferSelect;
+    error: unknown;
+    nextRunAt?: Date | null;
+  }) {
+    const triggeredAt = new Date();
+    const failureReason = input.error instanceof Error ? input.error.message : String(input.error);
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const [createdRun] = await txDb
+        .insert(routineRuns)
+        .values({
+          companyId: input.routine.companyId,
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          source: "schedule",
+          status: "failed",
+          triggeredAt,
+          failureReason,
+          completedAt: triggeredAt,
+          linkedIssueId: null,
+          routineRevisionId: input.routine.latestRevisionId,
+        })
+        .returning();
+      await updateRoutineTouchedState({
+        routineId: input.routine.id,
+        triggerId: input.trigger.id,
+        triggeredAt,
+        status: "failed",
+        nextRunAt: input.nextRunAt,
+      }, txDb);
+      return createdRun;
+    });
+
+    try {
+      await logActivity(db, {
+        companyId: input.routine.companyId,
+        actorType: "system",
+        actorId: "routine-scheduler",
+        action: "routine.run_failed",
+        entityType: "routine_run",
+        entityId: run.id,
+        details: {
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          source: "schedule",
+          status: "failed",
+          failureReason,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log failed routine run");
+    }
+
+    return run;
+  }
+
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
     if (!dispatchFingerprint) return null;
     // The "default" arm preserves coalescing against pre-migration open issues.
@@ -2404,59 +2462,82 @@ export function routineService(
       for (const row of due) {
         if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
 
-        // Suppress scheduled firings while the routine's project is paused. The tick is still
-        // claimed and advanced to the next single cron tick (no backfill), so resume continues
-        // at the next cron boundary instead of replaying missed firings. Routines with no
-        // project are never suppressed here.
-        const projectPaused = !!(row.routine.projectId && row.projectPausedAt);
+        let claimedNextRunAtForFailure: Date | null = null;
+        try {
+          // Suppress scheduled firings while the routine's project is paused. The tick is still
+          // claimed and advanced to the next single cron tick (no backfill), so resume continues
+          // at the next cron boundary instead of replaying missed firings. Routines with no
+          // project are never suppressed here.
+          const projectPaused = !!(row.routine.projectId && row.projectPausedAt);
 
-        let runCount = 1;
-        let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+          let runCount = 1;
+          let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+          claimedNextRunAtForFailure = claimedNextRunAt;
 
-        if (!projectPaused && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
-          let cursor: Date | null = row.trigger.nextRunAt;
-          runCount = 0;
-          while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
-            runCount += 1;
-            claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
-            cursor = claimedNextRunAt;
+          if (!projectPaused && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
+            let cursor: Date | null = row.trigger.nextRunAt;
+            runCount = 0;
+            while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
+              runCount += 1;
+              claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
+              cursor = claimedNextRunAt;
+            }
           }
-        }
+          claimedNextRunAtForFailure = claimedNextRunAt;
 
-        const claimed = await db
-          .update(routineTriggers)
-          .set({
-            nextRunAt: claimedNextRunAt,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(routineTriggers.id, row.trigger.id),
-              eq(routineTriggers.enabled, true),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
-            ),
-          )
-          .returning({ id: routineTriggers.id })
-          .then((rows) => rows[0] ?? null);
-        if (!claimed) continue;
+          const claimed = await db
+            .update(routineTriggers)
+            .set({
+              nextRunAt: claimedNextRunAt,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(routineTriggers.id, row.trigger.id),
+                eq(routineTriggers.enabled, true),
+                eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
+              ),
+            )
+            .returning({ id: routineTriggers.id })
+            .then((rows) => rows[0] ?? null);
+          if (!claimed) continue;
 
-        if (projectPaused) {
-          await recordSuppressedScheduleRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            reason: "paused",
-            nextRunAt: claimedNextRunAt,
-          });
-          continue;
-        }
+          if (projectPaused) {
+            await recordSuppressedScheduleRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              reason: "paused",
+              nextRunAt: claimedNextRunAt,
+            });
+            continue;
+          }
 
-        for (let i = 0; i < runCount; i += 1) {
-          await dispatchRoutineRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-          });
-          triggered += 1;
+          for (let i = 0; i < runCount; i += 1) {
+            await dispatchRoutineRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              source: "schedule",
+            });
+            triggered += 1;
+          }
+        } catch (err) {
+          logger.error(
+            { err, routineId: row.routine.id, triggerId: row.trigger.id },
+            "routine scheduler trigger failed",
+          );
+          try {
+            await recordFailedScheduleRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              error: err,
+              nextRunAt: claimedNextRunAtForFailure,
+            });
+          } catch (recordErr) {
+            logger.error(
+              { err: recordErr, routineId: row.routine.id, triggerId: row.trigger.id },
+              "failed to record routine scheduler trigger failure",
+            );
+          }
         }
       }
 
