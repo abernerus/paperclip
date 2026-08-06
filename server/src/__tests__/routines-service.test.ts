@@ -52,6 +52,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.useRealTimers();
     if (originalSecretsProviderEnv === undefined) {
       delete process.env.PAPERCLIP_SECRETS_PROVIDER;
     } else {
@@ -1691,6 +1692,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const overdueAt = new Date("2026-08-05T23:30:00.000Z");
     const tickAt = new Date("2026-08-05T23:33:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(tickAt);
     await db
       .update(routineTriggers)
       .set({ nextRunAt: overdueAt, lastFiredAt: null, lastResult: null })
@@ -1783,7 +1786,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .set({ nextRunAt: new Date("2026-08-05T23:30:00.000Z") })
       .where(eq(routineTriggers.id, validTrigger.id));
 
-    expect(await svc.tickScheduledTriggers(new Date("2026-08-05T23:33:00.000Z"))).toEqual({ triggered: 1 });
+    const tickAt = new Date("2026-08-05T23:33:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(tickAt);
+    expect(await svc.tickScheduledTriggers(tickAt)).toEqual({ triggered: 1 });
 
     const brokenAfter = await db
       .select()
