@@ -394,6 +394,13 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: null,
       executionLockedAt: null,
     });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, otherAgentId, currentRunId)))
       .post(`/api/issues/${issueId}/checkout`)
