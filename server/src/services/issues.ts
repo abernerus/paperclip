@@ -267,6 +267,8 @@ export interface IssueFilters {
   includePluginOperations?: boolean;
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
+  excludeForeignLiveLaneOwnerForRunId?: string | null;
+  excludeForeignLaneOwnerForRunId?: string | null;
   hasPlanDocument?: boolean;
   lowTrustBoundary?: LowTrustBoundary & { companyId: string };
   q?: string;
@@ -1016,6 +1018,30 @@ function nonPluginOperationIssueCondition() {
     OR ${issues.originKind} LIKE 'plugin:%:operation:%'
     OR ${inArray(issues.originKind, LEGACY_PLUGIN_OPERATION_ORIGIN_KINDS)}
   )`;
+}
+
+const LIVE_LANE_OWNER_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+
+function notForeignLiveLaneOwnerCondition(currentRunId: string | null | undefined) {
+  return sql<boolean>`
+    NOT EXISTS (
+      SELECT 1
+      FROM ${heartbeatRuns}
+      WHERE ${heartbeatRuns.id} IN (${issues.checkoutRunId}, ${issues.executionRunId})
+        AND ${heartbeatRuns.status} IN (${sql.join(LIVE_LANE_OWNER_RUN_STATUSES.map((status) => sql`${status}`), sql`, `)})
+        ${currentRunId ? sql`AND ${heartbeatRuns.id} <> ${currentRunId}` : sql``}
+    )
+  `;
+}
+
+function notForeignLaneOwnerCondition(currentRunId: string | null | undefined) {
+  if (!currentRunId) {
+    return sql<boolean>`${issues.checkoutRunId} IS NULL AND ${issues.executionRunId} IS NULL`;
+  }
+  return sql<boolean>`
+    (${issues.checkoutRunId} IS NULL OR ${issues.checkoutRunId} = ${currentRunId})
+    AND (${issues.executionRunId} IS NULL OR ${issues.executionRunId} = ${currentRunId})
+  `;
 }
 
 function shouldIncludePluginOperationIssues(filters: IssueFilters | undefined) {
@@ -2925,6 +2951,12 @@ async function blockedInboxIssueConditions(
   } else if (assigneeAgentFilter) {
     conditions.push(eq(issues.assigneeAgentId, assigneeAgentFilter));
   }
+  if (filters?.excludeForeignLiveLaneOwnerForRunId !== undefined) {
+    conditions.push(notForeignLiveLaneOwnerCondition(filters.excludeForeignLiveLaneOwnerForRunId));
+  }
+  if (filters?.excludeForeignLaneOwnerForRunId !== undefined) {
+    conditions.push(notForeignLaneOwnerCondition(filters.excludeForeignLaneOwnerForRunId));
+  }
   if (filters?.participantAgentId) conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
   if (filters?.assigneeUserId) conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
   if (touchedByUserId) conditions.push(touchedByUserCondition(companyId, touchedByUserId));
@@ -3940,6 +3972,114 @@ export function issueService(db: Db) {
     });
   }
 
+  async function describeLaneOwnerConflict(
+    current: {
+      companyId?: string;
+      id?: string;
+      status?: string;
+      assigneeAgentId?: string | null;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    },
+    actorRunId: string | null,
+  ) {
+    const ownerRunIds = [...new Set([current.checkoutRunId, current.executionRunId].filter((id): id is string => Boolean(id)))];
+    const foreignOwnerRunIds = ownerRunIds.filter((id) => id !== actorRunId);
+    if (foreignOwnerRunIds.length === 0) {
+      return {
+        laneOwnerState: "same_or_unowned_lane" as const,
+        ownerRuns: [],
+        missingOwnerRunIds: [],
+        operatorMessage: "No foreign lane owner was found in the issue lock fields.",
+        forceReleaseRecommended: false,
+      };
+    }
+
+    const ownerRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId,
+      })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, foreignOwnerRunIds));
+    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const missingOwnerRunIds = foreignOwnerRunIds.filter((id) => !ownerRunById.has(id));
+    const hasLiveOwner = ownerRuns.some((run) =>
+      LIVE_LANE_OWNER_RUN_STATUSES.includes(run.status as (typeof LIVE_LANE_OWNER_RUN_STATUSES)[number])
+    );
+    if (hasLiveOwner) {
+      return {
+        laneOwnerState: "foreign_live_lane_owner" as const,
+        ownerRuns,
+        missingOwnerRunIds,
+        operatorMessage:
+          "A queued, running, or scheduled retry run owns this issue lane; wait for, cancel, or inspect that run instead of using stale-lock recovery.",
+        forceReleaseRecommended: false,
+      };
+    }
+
+    return {
+      laneOwnerState: "stale_or_missing_lane_owner" as const,
+      ownerRuns,
+      missingOwnerRunIds,
+      operatorMessage:
+        "The prior lane owner is terminal or missing; this is stale-lock recovery territory and should be handled through the audited recovery path.",
+      forceReleaseRecommended: true,
+    };
+  }
+
+  async function assertForeignLaneRecoveryAllowed(input: {
+    current: {
+      id: string;
+      companyId: string;
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    };
+    actorAgentId: string;
+    actorRunId: string | null;
+    rejectForeignLaneRecovery?: boolean;
+  }) {
+    if (!input.rejectForeignLaneRecovery) return;
+    const laneOwnerConflict = await describeLaneOwnerConflict(input.current, input.actorRunId);
+    if (laneOwnerConflict.laneOwnerState === "same_or_unowned_lane") return;
+
+    await db.insert(activityLog).values({
+      companyId: input.current.companyId,
+      actorType: "agent",
+      actorId: input.actorAgentId,
+      agentId: input.actorAgentId,
+      runId: input.actorRunId,
+      action: "issue.foreign_lane_checkout_refused",
+      entityType: "issue",
+      entityId: input.current.id,
+      details: {
+        issueId: input.current.id,
+        status: input.current.status,
+        assigneeAgentId: input.current.assigneeAgentId,
+        checkoutRunId: input.current.checkoutRunId,
+        executionRunId: input.current.executionRunId,
+        ...laneOwnerConflict,
+      },
+    });
+
+    throw conflict(
+      laneOwnerConflict.laneOwnerState === "foreign_live_lane_owner"
+        ? "Issue checkout conflict: foreign live lane owner"
+        : "Issue checkout conflict: stale foreign lane owner requires audited recovery",
+      {
+        issueId: input.current.id,
+        status: input.current.status,
+        assigneeAgentId: input.current.assigneeAgentId,
+        checkoutRunId: input.current.checkoutRunId,
+        executionRunId: input.current.executionRunId,
+        ...laneOwnerConflict,
+      },
+    );
+  }
+
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
@@ -4018,6 +4158,12 @@ export function issueService(db: Db) {
         conditions.push(isNull(issues.assigneeAgentId));
       } else if (assigneeAgentFilter) {
         conditions.push(eq(issues.assigneeAgentId, assigneeAgentFilter));
+      }
+      if (filters?.excludeForeignLiveLaneOwnerForRunId !== undefined) {
+        conditions.push(notForeignLiveLaneOwnerCondition(filters.excludeForeignLiveLaneOwnerForRunId));
+      }
+      if (filters?.excludeForeignLaneOwnerForRunId !== undefined) {
+        conditions.push(notForeignLaneOwnerCondition(filters.excludeForeignLaneOwnerForRunId));
       }
       if (filters?.participantAgentId) {
         conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
@@ -5477,7 +5623,13 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
-    checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+    checkout: async (
+      id: string,
+      agentId: string,
+      expectedStatuses: string[],
+      checkoutRunId: string | null,
+      options: { rejectForeignLaneRecovery?: boolean } = {},
+    ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -5500,6 +5652,26 @@ export function issueService(db: Db) {
           securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
         });
       }
+
+      const currentBeforeRecovery = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!currentBeforeRecovery) throw notFound("Issue not found");
+      await assertForeignLaneRecoveryAllowed({
+        current: currentBeforeRecovery,
+        actorAgentId: agentId,
+        actorRunId: checkoutRunId,
+        rejectForeignLaneRecovery: options.rejectForeignLaneRecovery,
+      });
 
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
@@ -5665,12 +5837,18 @@ export function issueService(db: Db) {
         return enriched;
       }
 
-      throw conflict("Issue checkout conflict", {
+      const laneOwnerConflict = await describeLaneOwnerConflict(current, checkoutRunId);
+      throw conflict(
+        laneOwnerConflict.laneOwnerState === "foreign_live_lane_owner"
+          ? "Issue checkout conflict: foreign live lane owner"
+          : "Issue checkout conflict",
+        {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        ...laneOwnerConflict,
       });
     },
 
