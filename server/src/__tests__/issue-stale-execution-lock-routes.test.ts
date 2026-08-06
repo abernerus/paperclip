@@ -398,6 +398,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .update(heartbeatRuns)
       .set({
         invocationSource: "assignment",
+        agentId: otherAgentId,
         contextSnapshot: { issueId },
       })
       .where(eq(heartbeatRuns.id, currentRunId));
