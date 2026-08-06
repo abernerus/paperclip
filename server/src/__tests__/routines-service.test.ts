@@ -1671,4 +1671,153 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runsAfterResume).toHaveLength(2);
     expect(runsAfterResume.some((run) => run.status === "issue_created")).toBe(true);
   });
+
+  it("dispatches an overdue enabled skip-if-active schedule once and advances trigger audit fields", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "schedule",
+        label: "night watch",
+        cronExpression: "*/30 0-7 6 8 *",
+        timezone: "Europe/Stockholm",
+      },
+      {},
+    );
+
+    const overdueAt = new Date("2026-08-05T23:30:00.000Z");
+    const tickAt = new Date("2026-08-05T23:33:00.000Z");
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: overdueAt, lastFiredAt: null, lastResult: null })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    expect(await svc.tickScheduledTriggers(tickAt)).toEqual({ triggered: 1 });
+    expect(await svc.tickScheduledTriggers(tickAt)).toEqual({ triggered: 0 });
+
+    const executionIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(executionIssues).toHaveLength(1);
+    expect(executionIssues[0]).toMatchObject({
+      companyId,
+      originKind: "routine_execution",
+      status: "todo",
+    });
+
+    const runs = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      source: "schedule",
+      status: "issue_created",
+      triggerId: trigger.id,
+      linkedIssueId: executionIssues[0]!.id,
+    });
+
+    const updatedTrigger = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id))
+      .then((rows) => rows[0]);
+    expect(updatedTrigger?.lastFiredAt).not.toBeNull();
+    expect(updatedTrigger?.lastResult).toBe(`Created execution issue ${executionIssues[0]!.id}`);
+    expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-08-06T00:00:00.000Z"));
+  });
+
+  it("records a failing overdue trigger and continues dispatching later due triggers", async () => {
+    const { agentId, companyId, projectId, routine: brokenRoutine, svc } = await seedFixture();
+    const validRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "valid routine",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "skip_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+    const { trigger: brokenTrigger } = await svc.createTrigger(
+      brokenRoutine.id,
+      {
+        kind: "schedule",
+        label: "bad stored trigger",
+        cronExpression: "0 * * * *",
+        timezone: "UTC",
+      },
+      {},
+    );
+    const { trigger: validTrigger } = await svc.createTrigger(
+      validRoutine.id,
+      {
+        kind: "schedule",
+        label: "valid",
+        cronExpression: "*/30 0-7 6 8 *",
+        timezone: "Europe/Stockholm",
+      },
+      {},
+    );
+
+    await db
+      .update(routineTriggers)
+      .set({
+        nextRunAt: new Date("2026-07-14T11:00:00.000Z"),
+        timezone: "Mars/Base",
+      })
+      .where(eq(routineTriggers.id, brokenTrigger.id));
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2026-08-05T23:30:00.000Z") })
+      .where(eq(routineTriggers.id, validTrigger.id));
+
+    expect(await svc.tickScheduledTriggers(new Date("2026-08-05T23:33:00.000Z"))).toEqual({ triggered: 1 });
+
+    const brokenAfter = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, brokenTrigger.id))
+      .then((rows) => rows[0]);
+    expect(brokenAfter?.nextRunAt).toBeNull();
+    expect(brokenAfter?.lastFiredAt).not.toBeNull();
+    expect(brokenAfter?.lastResult).toBe("Execution failed");
+
+    const failedRuns = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, brokenRoutine.id));
+    expect(failedRuns).toHaveLength(1);
+    expect(failedRuns[0]).toMatchObject({
+      source: "schedule",
+      status: "failed",
+      triggerId: brokenTrigger.id,
+      linkedIssueId: null,
+    });
+    expect(failedRuns[0]?.failureReason).toMatch(/Invalid timezone/i);
+
+    const validIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, validRoutine.id));
+    expect(validIssues).toHaveLength(1);
+    const validAfter = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, validTrigger.id))
+      .then((rows) => rows[0]);
+    expect(validAfter?.lastResult).toBe(`Created execution issue ${validIssues[0]!.id}`);
+    expect(validAfter?.nextRunAt).toEqual(new Date("2026-08-06T00:00:00.000Z"));
+  });
 });
